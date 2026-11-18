@@ -27,7 +27,7 @@ export class LlmService {
 
   constructor(config: ConfigService) {
     const apiKey = config.get<string>('LLM_API_KEY');
-    this.model = config.get<string>('LLM_MODEL', 'gemini-2.5-flash');
+    this.model = config.get<string>('LLM_MODEL', 'gemini-3.8-flash');
     this.maxTokens = Number(config.get('LLM_MAX_TOKENS', 2048));
 
     // No real key → mock mode, so the frontend can be wired up today.
