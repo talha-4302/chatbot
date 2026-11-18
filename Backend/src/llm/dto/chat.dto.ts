@@ -11,7 +11,7 @@ import {
   Min,
   ValidateNested,
 } from 'class-validator';
-import { Role } from '../llm.service';
+import { MODELS, Role } from '../llm.service';
 
 export class MessageDto {
   @IsIn(['user', 'assistant'])
@@ -38,4 +38,8 @@ export class ChatRequestDto {
   @Min(0)
   @Max(1)
   temperature?: number;
+
+  @IsOptional()
+  @IsIn(MODELS)
+  model?: string;
 }

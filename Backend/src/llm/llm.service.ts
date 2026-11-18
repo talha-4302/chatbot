@@ -16,6 +16,9 @@ export interface ChatResult {
   mock: boolean;
 }
 
+// Allowlist: the model name goes into the request URL, so never accept arbitrary strings.
+export const MODELS = ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.5-flash', 'gemini-3.7-flash', 'gemini-3.8-flash'];
+
 const PLACEHOLDER = 'your-api-key-here';
 
 @Injectable()
@@ -27,7 +30,7 @@ export class LlmService {
 
   constructor(config: ConfigService) {
     const apiKey = config.get<string>('LLM_API_KEY');
-    this.model = config.get<string>('LLM_MODEL', 'gemini-3.8-flash');
+    this.model = config.get<string>('LLM_MODEL', 'gemini-3.5-flash-lite');
     this.maxTokens = Number(config.get('LLM_MAX_TOKENS', 2048));
 
     // No real key → mock mode, so the frontend can be wired up today.
@@ -39,14 +42,17 @@ export class LlmService {
    * Stateless by design: the caller passes the FULL history every time.
    * The model holds nothing between calls.
    */
-  async chat(messages: ChatMessage[], system?: string, temperature?: number): Promise<ChatResult> {
+  async chat(messages: ChatMessage[], system?: string, temperature?: number, model = this.model): Promise<ChatResult> {
     const started = Date.now();
 
     if (!this.apiKey) return this.mockReply(messages, started);
 
     // Gemini REST via built-in fetch (no SDK). Roles are 'user' | 'model'.
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent`, {
+    let res: Response;
+    try {
+      res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
       method: 'POST',
+      signal: AbortSignal.timeout(30_000), // never hang the client if the provider stalls
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': this.apiKey },
       body: JSON.stringify({
         ...(system && { systemInstruction: { parts: [{ text: system }] } }),
@@ -59,11 +65,15 @@ export class LlmService {
           ...(temperature !== undefined && { temperature }),
         },
       }),
-    });
+      });
+    } catch (err) {
+      this.logger.error(`LLM request failed: ${(err as Error).message}`);
+      throw new ServiceUnavailableException('LLM timed out or unreachable, retry shortly');
+    }
 
     if (!res.ok) {
       this.logger.error(`LLM API error ${res.status}: ${await res.text()}`);
-      throw res.status === 429
+      throw res.status === 429 || res.status === 503
         ? new ServiceUnavailableException('LLM rate limited, retry shortly')
         : new BadGatewayException('LLM provider error');
     }
@@ -74,7 +84,7 @@ export class LlmService {
     const u = data.usageMetadata;
     const result: ChatResult = {
       reply,
-      model: data.modelVersion ?? this.model,
+      model: data.modelVersion ?? model,
       stopReason: cand?.finishReason ?? null,
       usage: u ? { inputTokens: u.promptTokenCount ?? 0, outputTokens: u.candidatesTokenCount ?? 0 } : null,
       latencyMs: Date.now() - started,
@@ -84,6 +94,10 @@ export class LlmService {
     this.logger.log(`in=${result.usage?.inputTokens} out=${result.usage?.outputTokens} stop=${result.stopReason} ${result.latencyMs}ms`);
     if (result.stopReason === 'MAX_TOKENS') this.logger.warn('Reply was truncated by max_tokens');
     return result;
+  }
+
+  models() {
+    return { models: [...new Set([this.model, ...MODELS])], default: this.model };
   }
 
   private mockReply(messages: ChatMessage[], started: number): ChatResult {

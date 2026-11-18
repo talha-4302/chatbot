@@ -12,15 +12,21 @@
   .assistant { align-self: flex-start; background: #fff; border: 1px solid #ddd; }
   form { display: flex; gap: 8px; padding: 12px; background: #fff; border-top: 1px solid #ddd; }
   input { flex: 1; padding: 10px; font: inherit; }
+  select { padding: 10px; font: inherit; }
   button { padding: 10px 16px; font: inherit; }
 </style>
 </head>
 <body>
 <div id="log"></div>
-<form id="f"><input id="t" placeholder="Type a message..." autocomplete="off" autofocus><button>Send</button></form>
+<form id="f"><select id="m" title="Model"></select><input id="t" placeholder="Type a message..." autocomplete="off" autofocus><button>Send</button></form>
 <script>
   const API = 'http://localhost:3000/chat';
   const history = []; // stateless backend: we resend the full history each turn
+  const m = document.getElementById('m');
+  fetch(API + '/models').then((r) => r.json()).then(({ models, default: d }) => {
+    m.innerHTML = models.map((x) => `<option>${x}</option>`).join('');
+    m.value = d;
+  });
   const log = document.getElementById('log'), t = document.getElementById('t');
 
   function add(role, text) {
@@ -44,7 +50,7 @@
       const r = await fetch(API, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: history }),
+        body: JSON.stringify({ messages: history, model: m.value }),
       });
       if (!r.ok) throw new Error((await r.json()).message || r.status);
       const { reply } = await r.json();
