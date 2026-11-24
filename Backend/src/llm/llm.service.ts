@@ -1,5 +1,7 @@
 import { Injectable, Logger, ServiceUnavailableException, BadGatewayException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { APICallError, RetryError, generateText } from 'ai';
+import { createGoogleGenerativeAI } from '@ai-sdk/google';
 
 export type Role = 'user' | 'assistant';
 export interface ChatMessage {
@@ -10,13 +12,13 @@ export interface ChatMessage {
 export interface ChatResult {
   reply: string;
   model: string;
-  stopReason: string | null; // 'end_turn' | 'max_tokens' | ...
+  stopReason: string | null; // 'stop' | 'length' | ...
   usage: { inputTokens: number; outputTokens: number } | null; // null in mock mode
   latencyMs: number;
   mock: boolean;
 }
 
-// Allowlist: the model name goes into the request URL, so never accept arbitrary strings.
+// Allowlist: only these model names are accepted from clients.
 export const MODELS = ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.5-flash', 'gemini-3.7-flash', 'gemini-3.8-flash'];
 
 const PLACEHOLDER = 'your-api-key-here';
@@ -24,7 +26,7 @@ const PLACEHOLDER = 'your-api-key-here';
 @Injectable()
 export class LlmService {
   private readonly logger = new Logger(LlmService.name);
-  private readonly apiKey: string | null;
+  private readonly google: ReturnType<typeof createGoogleGenerativeAI> | null;
   private readonly model: string;
   private readonly maxTokens: number;
 
@@ -34,66 +36,54 @@ export class LlmService {
     this.maxTokens = Number(config.get('LLM_MAX_TOKENS', 2048));
 
     // No real key → mock mode, so the frontend can be wired up today.
-    this.apiKey = apiKey && apiKey !== PLACEHOLDER ? apiKey : null;
-    if (!this.apiKey) this.logger.warn('No API key set — running in MOCK mode.');
+    this.google = apiKey && apiKey !== PLACEHOLDER ? createGoogleGenerativeAI({ apiKey }) : null;
+    if (!this.google) this.logger.warn('No API key set — running in MOCK mode.');
   }
 
   /**
    * Stateless by design: the caller passes the FULL history every time.
    * The model holds nothing between calls.
+   * Provider-specific code lives only here: to switch provider, change the imports and the model call.
    */
   async chat(messages: ChatMessage[], system?: string, temperature?: number, model = this.model): Promise<ChatResult> {
     const started = Date.now();
 
-    if (!this.apiKey) return this.mockReply(messages, started);
+    if (!this.google) return this.mockReply(messages, started);
 
-    // Gemini REST via built-in fetch (no SDK). Roles are 'user' | 'model'.
-    let res: Response;
     try {
-      res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-      method: 'POST',
-      signal: AbortSignal.timeout(30_000), // never hang the client if the provider stalls
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': this.apiKey },
-      body: JSON.stringify({
-        ...(system && { systemInstruction: { parts: [{ text: system }] } }),
-        contents: messages.map((m) => ({
-          role: m.role === 'assistant' ? 'model' : 'user',
-          parts: [{ text: m.content }],
-        })),
-        generationConfig: {
-          maxOutputTokens: this.maxTokens,
-          ...(temperature !== undefined && { temperature }),
-        },
-      }),
+      const res = await generateText({
+        model: this.google(model),
+        system,
+        messages, // the SDK maps 'assistant' to Gemini's 'model' role for us
+        maxOutputTokens: this.maxTokens,
+        temperature,
+        abortSignal: AbortSignal.timeout(30_000), // covers retries too: never hang the client
       });
+
+      const result: ChatResult = {
+        reply: res.text,
+        model: res.response.modelId ?? model,
+        stopReason: res.finishReason ?? null,
+        usage: { inputTokens: res.usage.inputTokens ?? 0, outputTokens: res.usage.outputTokens ?? 0 },
+        latencyMs: Date.now() - started,
+        mock: false,
+      };
+
+      this.logger.log(`in=${result.usage?.inputTokens} out=${result.usage?.outputTokens} stop=${result.stopReason} ${result.latencyMs}ms`);
+      if (result.stopReason === 'length') this.logger.warn('Reply was truncated by max_tokens');
+      return result;
     } catch (err) {
-      this.logger.error(`LLM request failed: ${(err as Error).message}`);
-      throw new ServiceUnavailableException('LLM timed out or unreachable, retry shortly');
+      // After retries the SDK wraps the real error in RetryError.
+      const cause = RetryError.isInstance(err) ? err.lastError : err;
+      const status = APICallError.isInstance(cause) ? cause.statusCode : undefined;
+      this.logger.error(`LLM call failed (${status ?? 'no status'}): ${(cause as Error).message}`);
+
+      const name = (cause as Error).name;
+      const transient = status === 429 || status === 503 || name === 'TimeoutError' || name === 'AbortError';
+      if (transient) throw new ServiceUnavailableException('LLM busy or timed out, retry shortly');
+      if (APICallError.isInstance(cause)) throw new BadGatewayException('LLM provider error');
+      throw err;
     }
-
-    if (!res.ok) {
-      this.logger.error(`LLM API error ${res.status}: ${await res.text()}`);
-      throw res.status === 429 || res.status === 503
-        ? new ServiceUnavailableException('LLM rate limited, retry shortly')
-        : new BadGatewayException('LLM provider error');
-    }
-
-    const data: any = await res.json();
-    const cand = data.candidates?.[0];
-    const reply = (cand?.content?.parts ?? []).map((p: any) => p.text ?? '').join('');
-    const u = data.usageMetadata;
-    const result: ChatResult = {
-      reply,
-      model: data.modelVersion ?? model,
-      stopReason: cand?.finishReason ?? null,
-      usage: u ? { inputTokens: u.promptTokenCount ?? 0, outputTokens: u.candidatesTokenCount ?? 0 } : null,
-      latencyMs: Date.now() - started,
-      mock: false,
-    };
-
-    this.logger.log(`in=${result.usage?.inputTokens} out=${result.usage?.outputTokens} stop=${result.stopReason} ${result.latencyMs}ms`);
-    if (result.stopReason === 'MAX_TOKENS') this.logger.warn('Reply was truncated by max_tokens');
-    return result;
   }
 
   models() {
@@ -105,7 +95,7 @@ export class LlmService {
     return {
       reply: `[mock] You said: "${last}". (${messages.length} messages in history)`,
       model: 'mock',
-      stopReason: 'end_turn',
+      stopReason: 'stop',
       usage: null, // no fake token counts
       latencyMs: Date.now() - started,
       mock: true,
